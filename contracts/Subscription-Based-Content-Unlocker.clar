@@ -6,6 +6,7 @@
 (define-constant ERR-TIER-NOT-FOUND (err u105))
 (define-constant ERR-NO-REVENUE (err u106))
 (define-constant ERR-WITHDRAWALS-PAUSED (err u107))
+(define-constant ERR-RENEWAL-DISABLED (err u108))
 
 (define-constant SUBSCRIPTION-DURATION u2160)
 (define-constant CONTRACT-OWNER tx-sender)
@@ -41,7 +42,9 @@
         tier: uint,
         start-height: uint,
         end-height: uint,
-        active: bool
+        active: bool,
+        auto-renew: bool,
+        renewal-count: uint
     }
 )
 
@@ -103,7 +106,9 @@
                 tier: tier-id,
                 start-height: current-height,
                 end-height: (+ current-height SUBSCRIPTION-DURATION),
-                active: true
+                active: true,
+                auto-renew: false,
+                renewal-count: u0
             }
         )
         
@@ -216,5 +221,83 @@
         (if (is-some creator-data)
             (ok (get revenue (unwrap-panic creator-data)))
             ERR-NOT-AUTHORIZED)
+    )
+)
+
+(define-public (enable-auto-renewal (creator principal))
+    (let
+        ((subscription-key { subscriber: tx-sender, creator: creator })
+         (subscription (unwrap! (map-get? subscriptions subscription-key) ERR-INVALID-SUBSCRIPTION)))
+        
+        (asserts! (get active subscription) ERR-INVALID-SUBSCRIPTION)
+        
+        (map-set subscriptions 
+            subscription-key
+            (merge subscription { auto-renew: true })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (disable-auto-renewal (creator principal))
+    (let
+        ((subscription-key { subscriber: tx-sender, creator: creator })
+         (subscription (unwrap! (map-get? subscriptions subscription-key) ERR-INVALID-SUBSCRIPTION)))
+        
+        (asserts! (get active subscription) ERR-INVALID-SUBSCRIPTION)
+        
+        (map-set subscriptions 
+            subscription-key
+            (merge subscription { auto-renew: false })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (process-auto-renewal (subscriber principal) (creator principal))
+    (let
+        ((subscription-key { subscriber: subscriber, creator: creator })
+         (subscription (unwrap! (map-get? subscriptions subscription-key) ERR-INVALID-SUBSCRIPTION))
+         (tier (unwrap! (map-get? subscription-tiers (get tier subscription)) ERR-TIER-NOT-FOUND))
+         (current-height burn-block-height))
+        
+        (asserts! (get auto-renew subscription) ERR-RENEWAL-DISABLED)
+        (asserts! (<= (get end-height subscription) current-height) ERR-INVALID-SUBSCRIPTION)
+        (asserts! (>= (stx-get-balance subscriber) (get price tier)) ERR-INSUFFICIENT-FUNDS)
+        
+        (try! (stx-transfer? (get price tier) subscriber (as-contract tx-sender)))
+        
+        (let ((creator-data (unwrap-panic (map-get? creators creator))))
+            (map-set creators creator (merge creator-data {
+                revenue: (+ (get revenue creator-data) (get price tier))
+            }))
+        )
+        
+        (map-set subscriptions 
+            subscription-key
+            (merge subscription {
+                start-height: current-height,
+                end-height: (+ current-height (get duration tier)),
+                renewal-count: (+ (get renewal-count subscription) u1)
+            })
+        )
+        
+        (var-set total-revenue (+ (var-get total-revenue) (get price tier)))
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-renewal-status (subscriber principal) (creator principal))
+    (let
+        ((subscription (map-get? subscriptions { subscriber: subscriber, creator: creator })))
+        (if (is-some subscription)
+            (ok {
+                auto-renew: (get auto-renew (unwrap-panic subscription)),
+                renewal-count: (get renewal-count (unwrap-panic subscription))
+            })
+            ERR-INVALID-SUBSCRIPTION)
     )
 )
