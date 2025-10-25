@@ -7,9 +7,13 @@
 (define-constant ERR-NO-REVENUE (err u106))
 (define-constant ERR-WITHDRAWALS-PAUSED (err u107))
 (define-constant ERR-RENEWAL-DISABLED (err u108))
+(define-constant ERR-INSUFFICIENT-POINTS (err u109))
+(define-constant ERR-INVALID-REWARD (err u110))
 
 (define-constant SUBSCRIPTION-DURATION u2160)
 (define-constant CONTRACT-OWNER tx-sender)
+(define-constant POINTS-PER-RENEWAL u10)
+(define-constant BONUS-POINTS-THRESHOLD u5)
 
 (define-data-var platform-fee uint u50)
 (define-data-var total-subscribers uint u0)
@@ -54,6 +58,24 @@
         creator: principal,
         tier-required: uint,
         metadata: (string-ascii 256)
+    }
+)
+
+(define-map loyalty-points
+    { subscriber: principal, creator: principal }
+    {
+        points: uint,
+        total-earned: uint,
+        last-reward-claim: uint
+    }
+)
+
+(define-map reward-catalog
+    { creator: principal, reward-id: uint }
+    {
+        cost: uint,
+        description: (string-ascii 128),
+        available: bool
     }
 )
 
@@ -286,6 +308,26 @@
         
         (var-set total-revenue (+ (var-get total-revenue) (get price tier)))
         
+        (let
+            ((loyalty-key { subscriber: subscriber, creator: creator })
+             (existing-loyalty (map-get? loyalty-points loyalty-key))
+             (new-renewal-count (+ (get renewal-count subscription) u1))
+             (points-earned (if (>= new-renewal-count BONUS-POINTS-THRESHOLD)
+                               (* POINTS-PER-RENEWAL u2)
+                               POINTS-PER-RENEWAL)))
+            (if (is-some existing-loyalty)
+                (let ((loyalty-data (unwrap-panic existing-loyalty)))
+                    (map-set loyalty-points loyalty-key {
+                        points: (+ (get points loyalty-data) points-earned),
+                        total-earned: (+ (get total-earned loyalty-data) points-earned),
+                        last-reward-claim: (get last-reward-claim loyalty-data)
+                    }))
+                (map-set loyalty-points loyalty-key {
+                    points: points-earned,
+                    total-earned: points-earned,
+                    last-reward-claim: u0
+                })))
+        
         (ok true)
     )
 )
@@ -300,4 +342,57 @@
             })
             ERR-INVALID-SUBSCRIPTION)
     )
+)
+
+(define-public (create-reward (reward-id uint) (cost uint) (description (string-ascii 128)))
+    (let
+        ((creator-data (unwrap! (map-get? creators tx-sender) ERR-NOT-AUTHORIZED))
+         (reward-key { creator: tx-sender, reward-id: reward-id }))
+        
+        (ok (map-set reward-catalog reward-key {
+            cost: cost,
+            description: description,
+            available: true
+        }))
+    )
+)
+
+(define-public (redeem-reward (creator principal) (reward-id uint))
+    (let
+        ((loyalty-key { subscriber: tx-sender, creator: creator })
+         (loyalty-data (unwrap! (map-get? loyalty-points loyalty-key) ERR-INVALID-SUBSCRIPTION))
+         (reward-key { creator: creator, reward-id: reward-id })
+         (reward (unwrap! (map-get? reward-catalog reward-key) ERR-INVALID-REWARD)))
+        
+        (asserts! (get available reward) ERR-INVALID-REWARD)
+        (asserts! (>= (get points loyalty-data) (get cost reward)) ERR-INSUFFICIENT-POINTS)
+        
+        (map-set loyalty-points loyalty-key {
+            points: (- (get points loyalty-data) (get cost reward)),
+            total-earned: (get total-earned loyalty-data),
+            last-reward-claim: burn-block-height
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (toggle-reward-availability (reward-id uint))
+    (let
+        ((creator-data (unwrap! (map-get? creators tx-sender) ERR-NOT-AUTHORIZED))
+         (reward-key { creator: tx-sender, reward-id: reward-id })
+         (reward (unwrap! (map-get? reward-catalog reward-key) ERR-INVALID-REWARD)))
+        
+        (ok (map-set reward-catalog reward-key (merge reward {
+            available: (not (get available reward))
+        })))
+    )
+)
+
+(define-read-only (get-loyalty-points (subscriber principal) (creator principal))
+    (map-get? loyalty-points { subscriber: subscriber, creator: creator })
+)
+
+(define-read-only (get-reward-details (creator principal) (reward-id uint))
+    (map-get? reward-catalog { creator: creator, reward-id: reward-id })
 )
